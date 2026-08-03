@@ -33,6 +33,7 @@
 #include <stddef.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <assert.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
