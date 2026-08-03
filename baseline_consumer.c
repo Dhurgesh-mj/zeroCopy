@@ -122,21 +122,54 @@ int main() {
     for (uint64_t i = 0; i < MSG_COUNT; i++) mean += latencies[i];
     mean /= MSG_COUNT;
 
-    printf("[baseline-consumer] Done in %.3f s\n", elapsed_sec);
-    printf("[baseline-consumer] Throughput: %.3f M msg/s\n", m_msg_s);
-    printf("[baseline-consumer] Bandwidth:  %.3f Gbit/s\n", gbit_s);
-    printf("[baseline-consumer] Latency (ns): Min: %" PRIu64 " | Mean: %.1f | p50: %" PRIu64 " | p90: %" PRIu64 " | p99: %" PRIu64 " | p99.9: %" PRIu64 " | Max: %" PRIu64 "\n",
-           latencies[0], mean,
-           latencies[(size_t)(MSG_COUNT * 50 / 100)],
-           latencies[(size_t)(MSG_COUNT * 90 / 100)],
-           latencies[(size_t)(MSG_COUNT * 99 / 100)],
-           latencies[(size_t)(MSG_COUNT * 999 / 1000)],
-           latencies[MSG_COUNT - 1]);
+    fprintf(stderr,
+        "\n"
+        "[baseline-consumer] ══════════════════════════════════════════════\n"
+        "[baseline-consumer] RESULTS\n"
+        "[baseline-consumer] ──────────────────────────────────────────────\n"
+        "[baseline-consumer] received:   %" PRIu64 " messages\n"
+        "[baseline-consumer] errors:     %" PRIu64 "\n"
+        "[baseline-consumer] elapsed:    %.3f s\n"
+        "[baseline-consumer] throughput: %.2f M msg/s\n"
+        "[baseline-consumer] bandwidth:  %.2f Gbit/s\n"
+        "[baseline-consumer] ──────────────────────────────────────────────\n"
+        "[baseline-consumer] LATENCY (one-way, ns)\n"
+        "[baseline-consumer]   min:     %7" PRIu64 " ns\n"
+        "[baseline-consumer]   mean:    %7.0f ns\n"
+        "[baseline-consumer]   p50:     %7" PRIu64 " ns\n"
+        "[baseline-consumer]   p90:     %7" PRIu64 " ns\n"
+        "[baseline-consumer]   p99:     %7" PRIu64 " ns\n"
+        "[baseline-consumer]   p99.9:   %7" PRIu64 " ns\n"
+        "[baseline-consumer]   max:     %7" PRIu64 " ns\n"
+        "[baseline-consumer] ══════════════════════════════════════════════\n",
+        (uint64_t)MSG_COUNT,
+        errors,
+        elapsed_sec,
+        m_msg_s,
+        gbit_s,
+        latencies[0],
+        mean,
+        latencies[(size_t)(MSG_COUNT * 50 / 100)],
+        latencies[(size_t)(MSG_COUNT * 90 / 100)],
+        latencies[(size_t)(MSG_COUNT * 99 / 100)],
+        latencies[(size_t)(MSG_COUNT * 999 / 1000)],
+        latencies[MSG_COUNT - 1]);
 
-    if (errors > 0) {
-        printf("[baseline-consumer] FAIL: %" PRIu64 " errors detected!\n", errors);
+    if (errors == 0) {
+        fprintf(stderr,
+            "\n"
+            "  ╔══════════════════════════════════════════════════╗\n"
+            "  ║  ✓  ALL %" PRIu64 " MESSAGES VALIDATED          ║\n"
+            "  ║     ZERO CORRUPTION · ZERO REORDERING           ║\n"
+            "  ╚══════════════════════════════════════════════════╝\n\n",
+            (uint64_t)MSG_COUNT);
     } else {
-        printf("[baseline-consumer] PASS: All %" PRIu64 " messages validated successfully.\n", (uint64_t)MSG_COUNT);
+        fprintf(stderr,
+            "\n"
+            "  ╔══════════════════════════════════════════════════╗\n"
+            "  ║  ✗  FAILED — %" PRIu64 " ERRORS DETECTED                ║\n"
+            "  ╚══════════════════════════════════════════════════╝\n\n",
+            errors);
     }
 
     free(latencies);

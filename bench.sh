@@ -1,163 +1,181 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PIN_CORES=1
-if [[ "${1:-}" == "--no-pin" ]]; then
-    PIN_CORES=0
-fi
+# ═══════════════════════════════════════════════════════════════════════════
+#  Zero-Copy SPSC IPC — Benchmark Script
+#
+#  Usage:
+#    ./bench.sh              Full benchmark with CPU pinning
+#    ./bench.sh --no-pin     Skip taskset
+#    ./bench.sh --no-perf    Skip perf stat
+# ═══════════════════════════════════════════════════════════════════════════
 
+PIN=1
+USE_PERF=1
+for arg in "$@"; do
+    case "$arg" in
+        --no-pin)  PIN=0 ;;
+        --no-perf) USE_PERF=0 ;;
+    esac
+done
+
+# ── System Info ────────────────────────────────────────────────────────────
+echo "══════════════════════════════════════════════════════════════════"
+echo " ZERO-COPY SHARED-MEMORY IPC — BENCHMARK"
+echo "══════════════════════════════════════════════════════════════════"
+echo ""
 if [[ -f /proc/cpuinfo ]]; then
-    CPU_MODEL=$(awk -F': ' '/model name/ {print $2; exit}' /proc/cpuinfo)
-    NUM_CORES=$(grep -c processor /proc/cpuinfo)
+    CPU=$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo)
+    CORES=$(grep -c ^processor /proc/cpuinfo)
 else
-    CPU_MODEL="Unknown"
-    NUM_CORES="Unknown"
+    CPU="Unknown"; CORES="?"
 fi
-UNAME_R=$(uname -r || echo "Unknown")
+echo "  Kernel:  $(uname -r)"
+echo "  CPU:     $CPU ($CORES cores)"
+echo "  Pinning: $([ $PIN -eq 1 ] && echo 'ON (core 0 + core 1)' || echo 'OFF')"
 
-echo "System Info:"
-echo "  OS: Linux $UNAME_R"
-echo "  CPU: $CPU_MODEL ($NUM_CORES cores)"
+# ── Check perf permissions ─────────────────────────────────────────────────
+if [[ $USE_PERF -eq 1 ]]; then
+    if ! command -v perf &>/dev/null; then
+        echo "  perf:    NOT FOUND — running without hardware counters"
+        USE_PERF=0
+    elif ! perf stat -e cycles true 2>/dev/null; then
+        echo "  perf:    PERMISSION DENIED — running without hardware counters"
+        echo "           (fix: sudo sysctl kernel.perf_event_paranoid=-1)"
+        USE_PERF=0
+    else
+        echo "  perf:    OK"
+    fi
+fi
 echo ""
 
-# Cleanup
-PIDS_TO_KILL=()
-cleanup() {
-    for pid in "${PIDS_TO_KILL[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null || true
-        fi
-    done
-}
-trap cleanup EXIT
-
-# Check binaries
-BINARIES=("producer" "consumer" "futex_producer" "futex_consumer" "baseline_producer" "baseline_consumer")
-NEED_BUILD=0
-for bin in "${BINARIES[@]}"; do
+# ── Build if needed ────────────────────────────────────────────────────────
+for bin in producer consumer futex_producer futex_consumer baseline_producer baseline_consumer; do
     if [[ ! -x "./$bin" ]]; then
-        NEED_BUILD=1
+        echo "Building..."
+        make all
         break
     fi
 done
 
-if [[ $NEED_BUILD -eq 1 ]]; then
-    echo "Building targets..."
-    make all
-fi
-
-# perf check
-USE_PERF=0
-if command -v perf >/dev/null 2>&1; then
-    USE_PERF=1
-fi
-
-declare -A RESULTS
-
-extract_latency() {
-    local keyword="$1"
-    local file="$2"
-    # Convert to lowercase and find the keyword, then extract the first number found
-    awk -v kw="$keyword" 'tolower($0) ~ kw {match($0, /[0-9]+\.?[0-9]*/); if (RSTART>0) {print substr($0, RSTART, RLENGTH); exit}}' "$file"
-}
-
-run_bench() {
-    local name="$1"
-    local prod_bin="$2"
-    local cons_bin="$3"
-    
-    echo "Running benchmark: $name"
-    
-    local tmp_err=$(mktemp)
-    local perf_err=$(mktemp)
-    
-    local prod_cmd="./$prod_bin"
-    local cons_cmd="./$cons_bin"
-    
-    if [[ $PIN_CORES -eq 1 ]]; then
-        if command -v taskset >/dev/null 2>&1; then
-            prod_cmd="taskset -c 0 ./$prod_bin"
-            cons_cmd="taskset -c 1 ./$cons_bin"
-        fi
-    fi
-    
-    if [[ $USE_PERF -eq 1 ]]; then
-        cons_cmd="perf stat -e context-switches,page-faults,cpu-migrations,cache-misses,instructions,cycles -o $perf_err $cons_cmd"
-    fi
-    
-    $prod_cmd >/dev/null 2>&1 &
-    local prod_pid=$!
-    PIDS_TO_KILL+=($prod_pid)
-    
-    sleep 0.2
-    
-    # Run consumer (blocks until done)
-    $cons_cmd 2> "$tmp_err"
-    
-    # Parse latency
-    RESULTS["$name,lat min"]=$(extract_latency "min" "$tmp_err")
-    RESULTS["$name,lat mean"]=$(extract_latency "mean" "$tmp_err")
-    RESULTS["$name,lat p50"]=$(extract_latency "p50" "$tmp_err")
-    RESULTS["$name,lat p99"]=$(extract_latency "p99" "$tmp_err")
-    RESULTS["$name,lat p99.9"]=$(extract_latency "p99.9" "$tmp_err")
-    RESULTS["$name,lat max"]=$(extract_latency "max" "$tmp_err")
-    
-    # Provide fallbacks if parsing failed
-    for metric in "lat min" "lat mean" "lat p50" "lat p99" "lat p99.9" "lat max"; do
-        if [[ -z "${RESULTS["$name,$metric"]}" ]]; then
-            RESULTS["$name,$metric"]="N/A"
-        fi
+# ── Cleanup trap ───────────────────────────────────────────────────────────
+BG_PIDS=()
+TMPFILES=()
+cleanup() {
+    for pid in "${BG_PIDS[@]}"; do
+        kill -9 "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
     done
-    
-    # Parse perf counters
-    if [[ $USE_PERF -eq 1 ]]; then
-        RESULTS["$name,ctx-switches"]=$(awk '/context-switches/ {gsub(/,/,"",$1); print $1; exit}' "$perf_err")
-        RESULTS["$name,page-faults"]=$(awk '/page-faults/ {gsub(/,/,"",$1); print $1; exit}' "$perf_err")
-        RESULTS["$name,cache-misses"]=$(awk '/cache-misses/ {gsub(/,/,"",$1); print $1; exit}' "$perf_err")
-        
-        # Fallbacks
-        for metric in "ctx-switches" "page-faults" "cache-misses"; do
-            if [[ -z "${RESULTS["$name,$metric"]}" ]]; then
-                RESULTS["$name,$metric"]="N/A"
-            fi
-        done
+    for f in "${TMPFILES[@]}"; do
+        rm -f "$f"
+    done
+}
+trap cleanup EXIT
+
+# ── Helper: wrap command with optional taskset ─────────────────────────────
+pin() {
+    local core=$1; shift
+    if [[ $PIN -eq 1 ]] && command -v taskset &>/dev/null; then
+        taskset -c "$core" "$@"
     else
-        RESULTS["$name,ctx-switches"]="N/A"
-        RESULTS["$name,page-faults"]="N/A"
-        RESULTS["$name,cache-misses"]="N/A"
+        "$@"
     fi
-    
-    rm -f "$tmp_err" "$perf_err"
 }
 
-run_bench "Zero-Copy" "producer" "consumer"
-run_bench "Futex Hybrid" "futex_producer" "futex_consumer"
-run_bench "UDS Baseline" "baseline_producer" "baseline_consumer"
+# ── Run one benchmark variant ──────────────────────────────────────────────
+run_variant() {
+    local label="$1"
+    local prod="$2"
+    local cons="$3"
+    local out_file="$4"
+    local perf_file="$5"
+
+    echo "────────────────────────────────────────────────────────────────"
+    echo "  ▶ $label"
+    echo "────────────────────────────────────────────────────────────────"
+
+    # Clean stale shm
+    rm -f /dev/shm/zerocopy_ring 2>/dev/null || true
+
+    # Start producer in background (show its stderr so errors are visible)
+    pin 0 ./"$prod" &
+    local ppid=$!
+    BG_PIDS+=("$ppid")
+
+    sleep 0.3
+
+    # Start consumer (capture stderr for parsing, show it on screen too via tee)
+    local tmp=$(mktemp)
+    TMPFILES+=("$tmp")
+
+    if [[ $USE_PERF -eq 1 ]]; then
+        local ptmp=$(mktemp)
+        TMPFILES+=("$ptmp")
+        pin 1 perf stat -e context-switches,page-faults,cpu-migrations,cache-misses \
+            -o "$ptmp" ./"$cons" 2>&1 | tee "$tmp"
+        cp "$ptmp" "$perf_file"
+    else
+        pin 1 ./"$cons" 2>&1 | tee "$tmp"
+    fi
+
+    cp "$tmp" "$out_file"
+
+    # Wait for producer to finish
+    wait "$ppid" 2>/dev/null || true
+    echo ""
+}
+
+# ── Storage for results ────────────────────────────────────────────────────
+OUTDIR=$(mktemp -d)
+TMPFILES+=("$OUTDIR")
+
+run_variant "Zero-Copy (Spin)"    producer          consumer          "$OUTDIR/zc.txt"   "$OUTDIR/zc_perf.txt"
+run_variant "Futex Hybrid"        futex_producer     futex_consumer    "$OUTDIR/fx.txt"   "$OUTDIR/fx_perf.txt"
+run_variant "UDS Baseline"        baseline_producer  baseline_consumer "$OUTDIR/uds.txt"  "$OUTDIR/uds_perf.txt"
+
+# ── Parse results ──────────────────────────────────────────────────────────
+get_lat() {
+    # $1 = file, $2 = keyword (e.g. "min", "p50")
+    grep -i "$2" "$1" 2>/dev/null | grep -oP '[0-9]+\.?[0-9]*(?=\s*ns)' | head -1 || echo "N/A"
+}
+
+get_perf() {
+    # $1 = file, $2 = counter name
+    grep "$2" "$1" 2>/dev/null | grep -oP '[\d,]+' | head -1 | tr -d ',' || echo "N/A"
+}
+
+# ── Print comparison table ─────────────────────────────────────────────────
+echo ""
+echo "══════════════════════════════════════════════════════════════════"
+echo " RESULTS — SIDE-BY-SIDE COMPARISON"
+echo "══════════════════════════════════════════════════════════════════"
+echo ""
+
+ZC="$OUTDIR/zc.txt";  ZCP="$OUTDIR/zc_perf.txt"
+FX="$OUTDIR/fx.txt";  FXP="$OUTDIR/fx_perf.txt"
+UD="$OUTDIR/uds.txt"; UDP="$OUTDIR/uds_perf.txt"
+
+printf "  %-14s  %14s  %14s  %14s\n" "METRIC" "ZERO-COPY" "FUTEX" "UDS BASELINE"
+printf "  %-14s  %14s  %14s  %14s\n" "--------------" "--------------" "--------------" "--------------"
+
+for m in min mean p50 p90 p99 "p99.9" max; do
+    printf "  %-14s  %11s ns  %11s ns  %11s ns\n" \
+        "lat $m" "$(get_lat "$ZC" "$m")" "$(get_lat "$FX" "$m")" "$(get_lat "$UD" "$m")"
+done
+
+if [[ $USE_PERF -eq 1 ]]; then
+    printf "  %-14s  %14s  %14s  %14s\n" "--------------" "--------------" "--------------" "--------------"
+    for c in context-switches page-faults cache-misses; do
+        printf "  %-14s  %14s  %14s  %14s\n" \
+            "$c" "$(get_perf "$ZCP" "$c")" "$(get_perf "$FXP" "$c")" "$(get_perf "$UDP" "$c")"
+    done
+fi
 
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
-echo " ZERO-COPY SHARED-MEMORY IPC — BENCHMARK RESULTS"
-echo "══════════════════════════════════════════════════════════════════"
 echo ""
-echo "┌─────────────┬──────────────┬──────────────┬──────────────┐"
-echo "│ Metric      │ Zero-Copy    │ Futex Hybrid │ UDS Baseline │"
-echo "├─────────────┼──────────────┼──────────────┼──────────────┤"
-
-printf "│ %-11s │ %10s ns │ %10s ns │ %10s ns │\n" "lat min" "${RESULTS["Zero-Copy,lat min"]}" "${RESULTS["Futex Hybrid,lat min"]}" "${RESULTS["UDS Baseline,lat min"]}"
-printf "│ %-11s │ %10s ns │ %10s ns │ %10s ns │\n" "lat mean" "${RESULTS["Zero-Copy,lat mean"]}" "${RESULTS["Futex Hybrid,lat mean"]}" "${RESULTS["UDS Baseline,lat mean"]}"
-printf "│ %-11s │ %10s ns │ %10s ns │ %10s ns │\n" "lat p50" "${RESULTS["Zero-Copy,lat p50"]}" "${RESULTS["Futex Hybrid,lat p50"]}" "${RESULTS["UDS Baseline,lat p50"]}"
-printf "│ %-11s │ %10s ns │ %10s ns │ %10s ns │\n" "lat p99" "${RESULTS["Zero-Copy,lat p99"]}" "${RESULTS["Futex Hybrid,lat p99"]}" "${RESULTS["UDS Baseline,lat p99"]}"
-printf "│ %-11s │ %10s ns │ %10s ns │ %10s ns │\n" "lat p99.9" "${RESULTS["Zero-Copy,lat p99.9"]}" "${RESULTS["Futex Hybrid,lat p99.9"]}" "${RESULTS["UDS Baseline,lat p99.9"]}"
-printf "│ %-11s │ %10s ns │ %10s ns │ %10s ns │\n" "lat max" "${RESULTS["Zero-Copy,lat max"]}" "${RESULTS["Futex Hybrid,lat max"]}" "${RESULTS["UDS Baseline,lat max"]}"
-echo "├─────────────┼──────────────┼──────────────┼──────────────┤"
-printf "│ %-11s │ %12s │ %12s │ %12s │\n" "ctx-switch" "${RESULTS["Zero-Copy,ctx-switches"]}" "${RESULTS["Futex Hybrid,ctx-switches"]}" "${RESULTS["UDS Baseline,ctx-switches"]}"
-printf "│ %-11s │ %12s │ %12s │ %12s │\n" "page-faults" "${RESULTS["Zero-Copy,page-faults"]}" "${RESULTS["Futex Hybrid,page-faults"]}" "${RESULTS["UDS Baseline,page-faults"]}"
-printf "│ %-11s │ %12s │ %12s │ %12s │\n" "cache-misses" "${RESULTS["Zero-Copy,cache-misses"]}" "${RESULTS["Futex Hybrid,cache-misses"]}" "${RESULTS["UDS Baseline,cache-misses"]}"
-echo "└─────────────┴──────────────┴──────────────┴──────────────┘"
-
-echo ""
-echo "### Interpretation ###"
-echo "- Zero-Copy (Spin): Expect lowest latency, no context switches, but 100% CPU usage as it constantly polls."
-echo "- Futex Hybrid: Slightly higher latency than spin, but much better CPU efficiency. Avoids context switches when uncontended, sleeps via futex on contention."
-echo "- UDS Baseline: High latency due to kernel involvement (read/write syscalls) and high context switches on every message."
+echo "  Key takeaways:"
+echo "    • Zero-Copy latency should be 50-100× lower than UDS"
+echo "    • Zero-Copy context switches should be ~0 vs millions for UDS"
+echo "    • Futex hybrid trades ~1-2× latency for CPU efficiency"
 echo ""
