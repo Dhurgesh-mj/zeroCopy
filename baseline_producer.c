@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
@@ -69,7 +70,7 @@ int main() {
         return 1;
     }
 
-    printf("[baseline-producer] Consumer connected, sending %llu messages...\n", MSG_COUNT);
+    printf("[baseline-producer] Consumer connected, sending %" PRIu64 " messages...\n", (uint64_t)MSG_COUNT);
 
     uint64_t start_time = get_time_ns();
 

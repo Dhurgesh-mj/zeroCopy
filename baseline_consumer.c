@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
@@ -100,7 +101,7 @@ int main() {
 
         if (msg_error) {
             if (errors < 10) {
-                fprintf(stderr, "[baseline-consumer] ERROR on seq %llu: got seq=%llu\n", expected_seq, seq);
+                fprintf(stderr, "[baseline-consumer] ERROR on seq %" PRIu64 ": got seq=%" PRIu64 "\n", expected_seq, seq);
             }
             errors++;
         }
@@ -124,18 +125,18 @@ int main() {
     printf("[baseline-consumer] Done in %.3f s\n", elapsed_sec);
     printf("[baseline-consumer] Throughput: %.3f M msg/s\n", m_msg_s);
     printf("[baseline-consumer] Bandwidth:  %.3f Gbit/s\n", gbit_s);
-    printf("[baseline-consumer] Latency (ns): Min: %llu | Mean: %.1f | p50: %llu | p90: %llu | p99: %llu | p99.9: %llu | Max: %llu\n",
-           latencies[0], mean, 
-           latencies[(uint64_t)(MSG_COUNT * 0.50)],
-           latencies[(uint64_t)(MSG_COUNT * 0.90)],
-           latencies[(uint64_t)(MSG_COUNT * 0.99)],
-           latencies[(uint64_t)(MSG_COUNT * 0.999)],
+    printf("[baseline-consumer] Latency (ns): Min: %" PRIu64 " | Mean: %.1f | p50: %" PRIu64 " | p90: %" PRIu64 " | p99: %" PRIu64 " | p99.9: %" PRIu64 " | Max: %" PRIu64 "\n",
+           latencies[0], mean,
+           latencies[(size_t)(MSG_COUNT * 50 / 100)],
+           latencies[(size_t)(MSG_COUNT * 90 / 100)],
+           latencies[(size_t)(MSG_COUNT * 99 / 100)],
+           latencies[(size_t)(MSG_COUNT * 999 / 1000)],
            latencies[MSG_COUNT - 1]);
 
     if (errors > 0) {
-        printf("[baseline-consumer] FAIL: %llu errors detected!\n", errors);
+        printf("[baseline-consumer] FAIL: %" PRIu64 " errors detected!\n", errors);
     } else {
-        printf("[baseline-consumer] PASS: All %llu messages validated successfully.\n", MSG_COUNT);
+        printf("[baseline-consumer] PASS: All %" PRIu64 " messages validated successfully.\n", (uint64_t)MSG_COUNT);
     }
 
     free(latencies);
