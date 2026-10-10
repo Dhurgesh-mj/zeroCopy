@@ -92,10 +92,10 @@ baseline_consumer: baseline_consumer.c
 
 FORCE:
 
-t-%: FORCE %.c $(HEADER) $(HEADER_FUTEX)
+t-%: %.c $(HEADER) $(HEADER_FUTEX) FORCE
 	$(CC) $(CFLAGS) $(DEFS) -o $@ $< $(LDFLAGS)
 
-t-version: FORCE test_version.c $(HEADER)
+t-version: test_version.c $(HEADER) FORCE
 	$(CC) $(CFLAGS) $(DEFS) -o $@ $< $(LDFLAGS)
 
 # ── Cleanup ────────────────────────────────────────────────────────────────
