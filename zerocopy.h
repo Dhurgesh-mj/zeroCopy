@@ -40,6 +40,15 @@
 #include <unistd.h>
 #include <errno.h>
 
+/* Drop-in requirements: C11 compiler, Linux/POSIX shm (link -lrt on older
+ * glibc), 64-bit CPU (or libatomic on 32-bit ARM), and _GNU_SOURCE for the
+ * POSIX declarations below. Compiling with -std=gnu11 (the GCC default)
+ * needs nothing extra — this fires only for strict -std=c11 builds that
+ * forgot -D_GNU_SOURCE. Demo files define _GNU_SOURCE themselves. */
+#if !defined(_GNU_SOURCE) && (!defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 200809L)
+#warning "zerocopy.h: define _GNU_SOURCE (or pass -D_GNU_SOURCE) for POSIX declarations"
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  CPU Pause (spin-loop hint)
  *

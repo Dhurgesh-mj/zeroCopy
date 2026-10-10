@@ -268,7 +268,31 @@ What it does **not** do:
 
 ## API Reference
 
-Header-only library: `#include "zerocopy.h"` (spin) or `#include "zerocopy_futex.h"` (hybrid). Version: `ZC_VERSION` (`"1.1.0"`).
+Header-only library: drop `zerocopy.h` (+ `zerocopy_futex.h` for the hybrid)
+into any Linux project. Requirements: C11 compiler, `-D_GNU_SOURCE`,
+link `-lrt`, 64-bit CPU (or `libatomic` on 32-bit ARM). Version: `ZC_VERSION` (`"1.1.0"`).
+
+```c
+#define _GNU_SOURCE
+#include "zerocopy.h"   /* or "zerocopy_futex.h" for sleep/wake variant */
+
+/* producer */
+zc_handle_t h;
+zc_recover(&h, "/my_ring");          /* fresh ring (bumps generation) */
+uint8_t *slot = zc_acquire(&h);      /* raw pointer into shared memory */
+if (!slot) { /* consumer presumed dead */ }
+memcpy(slot, &my_data, sizeof my_data);  /* write DIRECTLY, zero copy */
+zc_publish(&h);                      /* release-store: visible to consumer */
+
+/* consumer */
+zc_handle_t h;
+while (zc_open(&h, "/my_ring") != 0) { /* EAGAIN: retry · EACCES/EPROTO: abort */ }
+const uint8_t *slot = zc_consume(&h);/* raw pointer into shared memory */
+if (!slot) { /* producer presumed dead */ }
+memcpy(&my_data, slot, sizeof my_data);  /* read DIRECTLY, zero copy */
+zc_release(&h);                      /* slot recyclable */
+```
+Build: `cc -std=c11 -O2 -o app app.c -lrt`
 
 | Function | Role | Returns |
 |---|---|---|
