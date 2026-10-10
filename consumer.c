@@ -18,8 +18,10 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <inttypes.h>
+#include <errno.h>
 
 #include "zerocopy.h"
 
@@ -59,9 +61,22 @@ int main(void)
     zc_handle_t h;
 
     /* Retry until the producer creates and initializes the segment.
-     * zc_open includes an fstat size guard — no SIGBUS risk.             */
+     * Gives up after 30 s; aborts immediately on hard errors (EACCES =
+     * someone else's segment, EPROTO = foreign/uninitialized segment). */
     fprintf(stderr, "[consumer] waiting for producer to create ring...\n");
+    uint64_t t_wait_start = now_ns();
     while (zc_open(&h, ZC_SHM_NAME) != 0) {
+        if (errno == EACCES || errno == EPROTO) {
+            fprintf(stderr, "[consumer] FATAL: cannot attach to ring: %s\n",
+                    errno == EACCES ? "segment owned by another user"
+                                    : "segment failed validation");
+            return 1;
+        }
+        if (now_ns() - t_wait_start > 30000000000ULL) {
+            fprintf(stderr, "[consumer] FATAL: producer did not create "
+                            "ring within 30 s\n");
+            return 1;
+        }
         struct timespec ts = { 0, 1000000 };   /* 1 ms */
         nanosleep(&ts, NULL);
     }
@@ -85,6 +100,7 @@ int main(void)
     uint64_t errors     = 0;
     uint64_t printed    = 0;
     uint64_t t_start    = now_ns();
+    uint64_t t_last_progress = t_start;
 
     for (uint64_t i = 0; i < MSG_COUNT; ++i) {
         /*
@@ -95,11 +111,12 @@ int main(void)
         const uint8_t *slot = (const uint8_t *)zc_consume(&h);
         uint64_t t_recv     = now_ns();
 
-        /* Read fields directly from shared memory (zero-copy) */
-        uint64_t seq      = *((const uint64_t *)(slot +  0));
-        uint64_t ts_send  = *((const uint64_t *)(slot +  8));
-        uint64_t checksum = *((const uint64_t *)(slot + 16));
-        uint64_t guard    = *((const uint64_t *)(slot + ZC_SLOT_SIZE - 8));
+        /* Read fields via memcpy (strict aliasing — see producer.c) */
+        uint64_t seq, ts_send, checksum, guard;
+        memcpy(&seq,      slot +  0, sizeof(seq));
+        memcpy(&ts_send,  slot +  8, sizeof(ts_send));
+        memcpy(&checksum, slot + 16, sizeof(checksum));
+        memcpy(&guard,    slot + ZC_SLOT_SIZE - 8, sizeof(guard));
 
         /* ── Validation ──────────────────────────────────────────────── */
 
@@ -141,6 +158,21 @@ int main(void)
          * Signals the producer that this slot can be recycled.
          */
         zc_release(&h);
+
+        /* Stall watchdog: if the producer dies mid-run, zc_consume()
+         * spins forever. Bail out instead of hanging. Checked once per
+         * 1024 messages — negligible cost. 5 s is far above the worst
+         * legitimate gap (max observed latency 324 ms). */
+        if ((i & 1023u) == 0) {
+            if (t_recv - t_last_progress > 5000000000ULL) {
+                fprintf(stderr, "[consumer] FATAL: no progress for 5 s — "
+                                "producer presumed dead\n");
+                free(latencies);
+                zc_close(&h);
+                return 1;
+            }
+            t_last_progress = t_recv;
+        }
     }
 
     uint64_t t_end = now_ns();

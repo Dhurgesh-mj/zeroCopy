@@ -11,8 +11,10 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <inttypes.h>
+#include <errno.h>
 
 #include "zerocopy_futex.h"
 
@@ -40,7 +42,19 @@ int main(void)
     zc_handle_t h;
 
     fprintf(stderr, "[futex-consumer] waiting for producer...\n");
+    uint64_t t_wait_start = now_ns();
     while (zc_open(&h, ZC_SHM_NAME) != 0) {
+        if (errno == EACCES || errno == EPROTO) {
+            fprintf(stderr, "[futex-consumer] FATAL: cannot attach to ring: %s\n",
+                    errno == EACCES ? "segment owned by another user"
+                                    : "segment failed validation");
+            return 1;
+        }
+        if (now_ns() - t_wait_start > 30000000000ULL) {
+            fprintf(stderr, "[futex-consumer] FATAL: producer did not create "
+                            "ring within 30 s\n");
+            return 1;
+        }
         struct timespec ts = { 0, 1000000 };
         nanosleep(&ts, NULL);
     }
@@ -64,15 +78,18 @@ int main(void)
     uint64_t errors  = 0;
     uint64_t printed = 0;
     uint64_t t_start = now_ns();
+    uint64_t t_last_progress = t_start;
 
     for (uint64_t i = 0; i < MSG_COUNT; ++i) {
         const uint8_t *slot = (const uint8_t *)zc_futex_consume(&h);
         uint64_t t_recv     = now_ns();
 
-        uint64_t seq      = *((const uint64_t *)(slot +  0));
-        uint64_t ts_send  = *((const uint64_t *)(slot +  8));
-        uint64_t checksum = *((const uint64_t *)(slot + 16));
-        uint64_t guard    = *((const uint64_t *)(slot + ZC_SLOT_SIZE - 8));
+        /* memcpy, not pointer casts (strict aliasing — see producer.c) */
+        uint64_t seq, ts_send, checksum, guard;
+        memcpy(&seq,      slot +  0, sizeof(seq));
+        memcpy(&ts_send,  slot +  8, sizeof(ts_send));
+        memcpy(&checksum, slot + 16, sizeof(checksum));
+        memcpy(&guard,    slot + ZC_SLOT_SIZE - 8, sizeof(guard));
 
         if (seq != i) {
             ++errors;
@@ -99,6 +116,20 @@ int main(void)
 
         latencies[i] = t_recv - ts_send;
         zc_futex_release(&h);
+
+        /* Stall watchdog: bounded futex waits alone can't detect a dead
+         * peer — bail out instead of looping forever. Checked once per
+         * 1024 messages; 5 s is far above any legitimate gap. */
+        if ((i & 1023u) == 0) {
+            if (t_recv - t_last_progress > 5000000000ULL) {
+                fprintf(stderr, "[futex-consumer] FATAL: no progress for 5 s — "
+                                "producer presumed dead\n");
+                free(latencies);
+                zc_close(&h);
+                return 1;
+            }
+            t_last_progress = t_recv;
+        }
     }
 
     uint64_t t_end = now_ns();

@@ -53,7 +53,7 @@ echo ""
 for bin in producer consumer futex_producer futex_consumer baseline_producer baseline_consumer; do
     if [[ ! -x "./$bin" ]]; then
         echo "Building..."
-        make all
+        make BENCH=1 all
         break
     fi
 done

@@ -12,8 +12,17 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 CC       = gcc
-CFLAGS   = -std=c11 -O3 -Wall -Wextra -Wpedantic -march=native
-LDFLAGS  = -lrt
+# Standard hardening: stack protector, _FORTIFY_SOURCE, PIE, full RELRO.
+# -march=native is benchmark-only: build with BENCH=1 to enable it
+# (default build stays portable across x86-64 machines).
+CFLAGS   = -std=c11 -O3 -Wall -Wextra -Wpedantic \
+           -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE \
+           -Werror=format-security
+LDFLAGS  = -pie -Wl,-z,relro,-z,now -lrt
+
+ifeq ($(BENCH),1)
+CFLAGS += -march=native
+endif
 
 HEADER       = zerocopy.h
 HEADER_FUTEX = zerocopy_futex.h
@@ -95,6 +104,7 @@ test-all: all
 
 # ── Full Benchmark ─────────────────────────────────────────────────────────
 
-bench: all
+bench:
+	$(MAKE) BENCH=1 all
 	chmod +x bench.sh
 	./bench.sh

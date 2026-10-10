@@ -58,13 +58,13 @@ memcpy() calls:        0                2             ← true zero-copy
 | **Empty/Full** | Monotonically increasing `uint64_t` counters (never wrap in 58 years) |
 | **False Sharing** | `_Alignas(64)` + `static_assert(offsetof(...) >= 64)` — **compile-time proof** |
 | **Wait Strategy** | Busy-wait (spin) baseline · Futex hybrid stretch goal |
-| **Zero-Copy** | No `memcpy` anywhere — `zc_acquire()` returns `void*` into shm |
+| **Zero-Copy** | No intermediate buffers or kernel copies — app writes directly into shm slots |
 
 ---
 
 ## Benchmark Results
 
-*12th Gen Intel Core i5-12400F · Linux 6.17 · GCC -O3 -march=native*
+*12th Gen Intel Core i5-12400F · Linux 6.17 · GCC -O3 (benchmark builds add `-march=native` via `make BENCH=1`)*
 
 ### Throughput
 
@@ -214,7 +214,35 @@ Every message carries **three corruption checks**:
 
 The guard word at the **last byte** of the 4 KiB slot catches memory ordering bugs that would be invisible to header-only checks.
 
+> **Scope:** these checks detect *accidental* corruption (bit rot, torn writes, race bugs).
+> They do **not** protect against tampering — any process that can write the
+> segment can forge a valid checksum. See [Security & Threat Model](#security--threat-model).
+
 ---
+
+## Security & Threat Model
+
+**Assumption: single user, cooperative processes on a local machine.**
+Both peers run as the same UID; either side can read, write, and destroy everything.
+
+What the code enforces (`zerocopy.h`):
+
+| Protection | How |
+|---|---|
+| No world-readable segments | `shm_open(..., 0600)` — owner only |
+| No name-squatting | `O_EXCL` create + `st_uid == geteuid()` check on open; a foreign-owned segment is refused with `EACCES` |
+| No stale/foreign segment reuse | magic + ABI version + layout validation on open (`EPROTO` on mismatch) |
+| No SIGBUS from size races | `fstat` size guard before `mmap`; no `O_TRUNC` on live objects |
+| No silent counter reset | `generation` counter bumped per create |
+| No infinite hangs | 30 s attach timeout + 5 s stall watchdog in demos; bounded futex waits in the library |
+| No `/tmp` socket hijack | baseline uses a Linux abstract-namespace socket (no filesystem entry) |
+
+What it does **not** do:
+
+- **No peer authentication** — any process running as *your* UID can attach to the ring. On a shared multi-user box, prefer a private runtime dir or pass the shm fd over an authenticated socket (`SCM_RIGHTS`) instead of a well-known name.
+- **No confidentiality** — payload travels in plaintext shared memory.
+- **No tamper evidence** — checksums/guards are forgeable by anyone with write access.
+- **No sealing** — for stronger setups, consider `memfd_create()` + `F_SEAL_SHRINK`/`F_SEAL_GROW` instead of POSIX shm.
 
 ## Requirements
 
@@ -225,7 +253,8 @@ The guard word at the **last byte** of the 4 KiB slot catches memory ordering bu
 ### Optional (for best results)
 
 ```bash
-# Enable perf counters
+# Enable perf counters (weakens a kernel security control system-wide —
+# prefer a benchmark-only session, then restore the default of 2)
 sudo sysctl kernel.perf_event_paranoid=-1
 
 # Isolate CPU cores (add to kernel boot params)
@@ -241,12 +270,11 @@ sudo cpupower frequency-set -g performance
 
 | Problem | Fix |
 |---|---|
-| Permission denied on shm | `sudo chmod 777 /dev/shm` |
-| Stale shared memory | `rm /dev/shm/zerocopy_ring` |
+| Permission denied on shm | Check ownership: `ls -l /dev/shm/zerocopy_ring` — remove the stale object **as its owner** (`rm /dev/shm/zerocopy_ring`). Never `chmod 777 /dev/shm` (makes all shm world-writable) |
+| Stale shared memory | `rm /dev/shm/zerocopy_ring` (as its owner) |
 | `perf` not found | `sudo apt install linux-tools-$(uname -r)` |
-| `perf` permission denied | `sudo sysctl kernel.perf_event_paranoid=-1` |
-| Stale UDS socket | `rm /tmp/zerocopy_baseline.sock` |
-| Consumer hangs | Start the producer first |
+| `perf` permission denied | `sudo sysctl kernel.perf_event_paranoid=-1` (benchmark sessions only; restores to 2 on reboot) |
+| Consumer hangs | Start the producer first (consumer gives up after 30 s; both sides abort on a 5 s stall) |
 
 ---
 

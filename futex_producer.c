@@ -14,6 +14,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <inttypes.h>
 
@@ -58,11 +59,13 @@ int main(void)
 
         uint64_t ts       = now_ns();
         uint64_t checksum = seq ^ CHECKSUM_MAGIC;
+        uint64_t guard    = seq ^ GUARD_MAGIC;
 
-        *((uint64_t *)(slot +  0)) = seq;
-        *((uint64_t *)(slot +  8)) = ts;
-        *((uint64_t *)(slot + 16)) = checksum;
-        *((uint64_t *)(slot + ZC_SLOT_SIZE - 8)) = seq ^ GUARD_MAGIC;
+        /* memcpy, not uint64_t* casts (strict aliasing — see producer.c) */
+        memcpy(slot +  0, &seq,      sizeof(seq));
+        memcpy(slot +  8, &ts,       sizeof(ts));
+        memcpy(slot + 16, &checksum, sizeof(checksum));
+        memcpy(slot + ZC_SLOT_SIZE - 8, &guard, sizeof(guard));
 
         zc_futex_publish(&h);
     }

@@ -17,6 +17,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <inttypes.h>
 
@@ -80,20 +81,24 @@ int main(void)
          */
         uint8_t *slot = (uint8_t *)zc_acquire(&h);
 
-        /* Write header at the START of the 4 KiB slot */
+        /* Write header at the START of the 4 KiB slot.
+         * memcpy (not uint64_t* casts): the slot is a byte buffer and the
+         * pointer-cast version violates C strict aliasing. GCC -O3 still
+         * compiles each memcpy to a single mov instruction. */
         uint64_t ts       = now_ns();
         uint64_t checksum = seq ^ CHECKSUM_MAGIC;
+        uint64_t guard    = seq ^ GUARD_MAGIC;
 
-        *((uint64_t *)(slot +  0)) = seq;
-        *((uint64_t *)(slot +  8)) = ts;
-        *((uint64_t *)(slot + 16)) = checksum;
+        memcpy(slot +  0, &seq,      sizeof(seq));
+        memcpy(slot +  8, &ts,       sizeof(ts));
+        memcpy(slot + 16, &checksum, sizeof(checksum));
 
         /*
          * Write guard word at the LAST 8 bytes of the slot.
          * This proves the entire 4 KiB page is coherent:
          * if we saw a stale/torn guard, the consumer catches it.
          */
-        *((uint64_t *)(slot + ZC_SLOT_SIZE - 8)) = seq ^ GUARD_MAGIC;
+        memcpy(slot + ZC_SLOT_SIZE - 8, &guard, sizeof(guard));
 
         /*
          * PUBLISH: release-store on head.

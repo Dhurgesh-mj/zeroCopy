@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <string.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/socket.h>
@@ -12,7 +13,7 @@
 
 #define MSG_COUNT 10000000ULL
 #define MSG_SIZE  4096u
-#define SOCK_PATH "/tmp/zerocopy_baseline.sock"
+#define SOCK_NAME "zerocopy_baseline"   /* abstract-namespace socket name */
 #define CHECKSUM_MAGIC 0xDEADBEEFCAFEBABEULL
 #define GUARD_MAGIC    0xCAFED00DC0FFEEEEULL
 
@@ -57,10 +58,14 @@ int main() {
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+    /* Must match the producer's abstract address (leading NUL). */
+    addr.sun_path[0] = '\0';
+    memcpy(addr.sun_path + 1, SOCK_NAME, sizeof(SOCK_NAME));  /* incl. NUL */
+    socklen_t addrlen =
+        (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + sizeof(SOCK_NAME));
 
     int retries = 0;
-    while (connect(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    while (connect(sock_fd, (struct sockaddr*)&addr, addrlen) < 0) {
         if (retries++ > 10) {
             perror("connect");
             return 1;

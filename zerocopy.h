@@ -38,6 +38,23 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  CPU Pause (spin-loop hint)
+ *
+ *  In tight spin loops, a pause/yield hint lets the sibling hyperthread
+ *  make progress and avoids memory-order penalties on x86. Zero effect
+ *  on correctness — pure politeness to the other core.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#if defined(__x86_64__) || defined(__i386__)
+#define ZC_CPU_PAUSE() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define ZC_CPU_PAUSE() __asm__ volatile("yield" ::: "memory")
+#else
+#define ZC_CPU_PAUSE() ((void)0)
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Ring Buffer Constants
@@ -65,9 +82,12 @@ static_assert(
  *  Shared Memory Layout
  *
  *  ┌─────────────────────────────────────────────────┐  offset 0
- *  │  head  (64-byte cache line, producer-owned)     │
+ *  │  head + head_futex (64-byte line, producer)     │
  *  ├─────────────────────────────────────────────────┤  offset 64
- *  │  tail  (64-byte cache line, consumer-owned)     │
+ *  │  tail + tail_futex (64-byte line, consumer)     │
+ *  ├─────────────────────────────────────────────────┤  offset 128
+ *  │  meta (magic/version/layout/generation)         │
+ *  │  …padding to next page…                         │
  *  ├─────────────────────────────────────────────────┤  offset 4096 (page)
  *  │  slots[0]      4 KiB                            │
  *  │  slots[1]      4 KiB                            │
@@ -75,12 +95,24 @@ static_assert(
  *  │  slots[1023]   4 KiB                            │
  *  └─────────────────────────────────────────────────┘
  *
- *  Total: sizeof(zc_control_t) padded to 4096 + (1024 × 4096) ≈ 4 MiB + 4 KiB
+ *  Total: 4096 (control page) + (1024 × 4096) ≈ 4 MiB + 4 KiB
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Magic + ABI version: validated by zc_open() so a stale or foreign
+ * segment (wrong build, uninitialized, attacker-planted) fails fast
+ * with EPROTO instead of being silently misread.                        */
+#define ZC_MAGIC        0x5A434F5059524E47ULL   /* ASCII "ZCOPYRNG" */
+#define ZC_ABI_VERSION  1u
 
 /*
  * Control block: two monotonically increasing 64-bit counters, each pinned
  * to its own 64-byte cache line.
+ *
+ * Each line also carries a 32-bit futex word that MIRRORS the low 32 bits
+ * of its counter for use with the futex(2) syscall (see zerocopy_futex.h).
+ * The futex words are plain uint32_t, written ONLY by the line's owner;
+ * the peer side must only pass their address to the futex syscall and
+ * must never load them in C (that would be a data race).
  *
  * Full condition:  head - tail == ZC_SLOT_COUNT
  * Empty condition: head == tail
@@ -92,7 +124,9 @@ static_assert(
  */
 typedef struct {
     _Alignas(64) atomic_uint_least64_t head;       /* written ONLY by producer */
+    uint32_t head_futex;                            /* producer-owned futex word */
     _Alignas(64) atomic_uint_least64_t tail;       /* written ONLY by consumer */
+    uint32_t tail_futex;                            /* consumer-owned futex word */
 } zc_control_t;
 
 /* ── Compile-Time Proof: No False Sharing ────────────────────────────────
@@ -115,14 +149,47 @@ static_assert(
     "FATAL: zc_control_t is not exactly 128 bytes — unexpected padding"
 );
 
+/* Compile-time proof: each futex word sits on the SAME cache line as the
+ * counter it mirrors (keeps the mirror store on an already-owned line). */
+static_assert(
+    offsetof(zc_control_t, head_futex) < 64,
+    "FATAL: head_futex is not on head's cache line"
+);
+static_assert(
+    offsetof(zc_control_t, tail_futex) >= 64 &&
+    offsetof(zc_control_t, tail_futex) < 128,
+    "FATAL: tail_futex is not on tail's cache line"
+);
+
+/*
+ * Segment metadata: lives in the otherwise-unused padding between the
+ * control block (offset 128) and the first slot (offset 4096).
+ * Written once by zc_create(), validated on every zc_open().
+ */
+typedef struct {
+    uint64_t magic;          /* == ZC_MAGIC once initialized      */
+    uint32_t abi_version;    /* == ZC_ABI_VERSION                  */
+    uint32_t slot_count;     /* == ZC_SLOT_COUNT                   */
+    uint32_t slot_size;      /* == ZC_SLOT_SIZE                    */
+    uint32_t _reserved;
+    uint64_t generation;     /* bumped on every zc_create()        */
+} zc_meta_t;
+
 /* ── The Complete Shared-Memory Region ─────────────────────────────────── */
 
 typedef struct {
     zc_control_t            ctl;
+    zc_meta_t               meta;   /* offset 128 — checked by zc_open   */
     _Alignas(4096) uint8_t  slots[ZC_SLOT_COUNT][ZC_SLOT_SIZE];
 } zc_ring_t;
 
 #define ZC_RING_SIZE  sizeof(zc_ring_t)
+
+/* Compile-time proof: the metadata fits in the control-page padding.     */
+static_assert(
+    offsetof(zc_ring_t, slots) >= sizeof(zc_control_t) + sizeof(zc_meta_t),
+    "FATAL: zc_meta_t does not fit between control block and slots"
+);
 
 /* Compile-time proof: payload area is at least 4 MiB.                     */
 static_assert(
@@ -151,14 +218,46 @@ typedef struct {
 /*
  * zc_create — Create and initialize the shared-memory ring (producer).
  *
- * - Creates the POSIX shm object, sizes it, and mmaps it.
- * - Zero-initializes head and tail (ring starts empty).
+ * - Creates the POSIX shm object with O_EXCL, sizes it, and mmaps it.
+ * - Refuses (EACCES) to reuse a pre-existing object owned by ANOTHER user:
+ *   otherwise anyone could pre-create the name and silently intercept all
+ *   IPC (name-squatting attack). Callers should zc_destroy() their own
+ *   stale segment first (as the demo producers do).
+ * - Initializes counters, futex words, and metadata; bumps generation.
+ * - Deliberately avoids O_TRUNC: truncating an object that a live peer
+ *   has mapped would shrink it to 0 bytes mid-run and SIGBUS the peer.
+ *   ftruncate() to the (already correct) size is a safe no-op instead.
  * - Returns 0 on success, -1 on failure (check errno).
+ *
+ * NOTE: re-creating while a consumer is attached resets the counters.
+ * A stale consumer detects this as an EPROTO generation mismatch only
+ * when it re-opens. Restarting the producer mid-run without restarting
+ * the consumer is unsupported — shut the consumer down first.
  */
 static inline int zc_create(zc_handle_t *h, const char *name)
 {
-    int fd = shm_open(name, O_CREAT | O_RDWR | O_TRUNC, 0600);
-    if (fd < 0) return -1;
+    int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) {
+        if (errno != EEXIST)
+            return -1;
+        /* Name already exists. Open it and check ownership instead of
+         * blindly reusing whatever is there. */
+        fd = shm_open(name, O_RDWR, 0);
+        if (fd < 0)
+            return -1;
+        struct stat sb;
+        if (fstat(fd, &sb) < 0) {
+            close(fd);
+            return -1;
+        }
+        if (sb.st_uid != geteuid()) {
+            /* Someone else's object — refuse to touch it. */
+            close(fd);
+            errno = EACCES;
+            return -1;
+        }
+        /* Self-owned stale object: fall through, resize + re-init below. */
+    }
 
     if (ftruncate(fd, (off_t)ZC_RING_SIZE) < 0) {
         close(fd);
@@ -173,9 +272,33 @@ static inline int zc_create(zc_handle_t *h, const char *name)
     h->ring   = (zc_ring_t *)p;
     h->cached = 0;
 
+    /* Preserve the generation of a self-owned predecessor so a stale
+     * consumer that re-opens can tell the ring was re-created.
+     * (Fresh zero-filled objects fail the magic check → generation 1.) */
+    uint64_t old_gen = 0;
+    if (h->ring->meta.magic       == ZC_MAGIC        &&
+        h->ring->meta.abi_version == ZC_ABI_VERSION  &&
+        h->ring->meta.slot_count  == ZC_SLOT_COUNT   &&
+        h->ring->meta.slot_size   == ZC_SLOT_SIZE)
+        old_gen = h->ring->meta.generation;
+
     /* Initialize counters — ring starts empty (head == tail == 0).         */
     atomic_store_explicit(&h->ring->ctl.head, 0, memory_order_relaxed);
+    h->ring->ctl.head_futex = 0;
     atomic_store_explicit(&h->ring->ctl.tail, 0, memory_order_relaxed);
+    h->ring->ctl.tail_futex = 0;
+
+    h->ring->meta.abi_version = ZC_ABI_VERSION;
+    h->ring->meta.slot_count  = ZC_SLOT_COUNT;
+    h->ring->meta.slot_size   = ZC_SLOT_SIZE;
+    h->ring->meta._reserved   = 0;
+    h->ring->meta.generation  = old_gen + 1;
+    /* Publish the metadata: release fence first, magic store last.
+     * A consumer that observes a nonzero magic is guaranteed to see
+     * all fields above (pairs with the acquire fence in zc_open),
+     * so it can never observe a half-written meta block. */
+    atomic_thread_fence(memory_order_release);
+    h->ring->meta.magic = ZC_MAGIC;
 
     return 0;
 }
@@ -184,6 +307,12 @@ static inline int zc_create(zc_handle_t *h, const char *name)
  * zc_open — Attach to an existing shared-memory ring (consumer).
  *
  * - Opens the POSIX shm object and mmaps it.
+ * - Validates size (SIGBUS guard), ownership (must be our own uid),
+ *   and metadata (magic/version/layout). Any mismatch fails with
+ *   errno = EPROTO (bad segment) or EACCES (someone else's segment)
+ *   instead of silently reading garbage.
+ * - Transient "producer hasn't finished creating yet" states fail with
+ *   errno = EAGAIN so callers can retry.
  * - Does NOT initialize counters (producer owns initialization).
  * - Returns 0 on success, -1 on failure (check errno).
  */
@@ -195,8 +324,18 @@ static inline int zc_open(zc_handle_t *h, const char *name)
     /* Guard against startup race: if the producer hasn't called ftruncate
      * yet, the shm object is zero-sized and mmap would SIGBUS on access. */
     struct stat sb;
-    if (fstat(fd, &sb) < 0 || (size_t)sb.st_size < ZC_RING_SIZE) {
+    if (fstat(fd, &sb) < 0) {
         close(fd);
+        return -1;
+    }
+    if ((size_t)sb.st_size < ZC_RING_SIZE) {
+        close(fd);
+        errno = EAGAIN;     /* not ready yet — caller may retry */
+        return -1;
+    }
+    if (sb.st_uid != geteuid()) {
+        close(fd);
+        errno = EACCES;     /* not ours — refuse to attach */
         return -1;
     }
 
@@ -204,6 +343,28 @@ static inline int zc_open(zc_handle_t *h, const char *name)
                     MAP_SHARED, fd, 0);
     close(fd);
     if (p == MAP_FAILED) return -1;
+
+    /* Validate the segment before trusting a single byte of it.
+     * All-zero metadata means the producer ftruncate()d but hasn't
+     * initialized yet — transient, caller may retry. */
+    const zc_meta_t *m = &((const zc_ring_t *)p)->meta;
+    const uint64_t magic = m->magic;    /* single load, then fence below */
+    if (magic == 0) {
+        munmap(p, ZC_RING_SIZE);
+        errno = EAGAIN;     /* not initialized yet — caller may retry */
+        return -1;
+    }
+    /* Acquire fence: pairs with the producer's release fence before the
+     * magic store, so the field loads below can't see torn metadata. */
+    atomic_thread_fence(memory_order_acquire);
+    if (magic            != ZC_MAGIC       ||
+        m->abi_version != ZC_ABI_VERSION ||
+        m->slot_count  != ZC_SLOT_COUNT  ||
+        m->slot_size   != ZC_SLOT_SIZE) {
+        munmap(p, ZC_RING_SIZE);
+        errno = EPROTO;     /* uninitialized / foreign / stale segment */
+        return -1;
+    }
 
     h->ring   = (zc_ring_t *)p;
     h->cached = 0;
@@ -271,6 +432,7 @@ static inline void *zc_acquire(zc_handle_t *h)
         if ((head - h->cached) < ZC_SLOT_COUNT)
             break;
         /* tight spin — baseline wait strategy */
+        ZC_CPU_PAUSE();
     }
 
 slot:
@@ -331,6 +493,7 @@ static inline void *zc_consume(zc_handle_t *h)
         if (h->cached != tail)
             break;
         /* tight spin — baseline wait strategy */
+        ZC_CPU_PAUSE();
     }
 
 slot:
