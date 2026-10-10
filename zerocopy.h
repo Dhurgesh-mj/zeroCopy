@@ -445,7 +445,7 @@ static inline int zc_recover(zc_handle_t *h, const char *name)
  *
  *  Usage:
  *      void *slot = zc_acquire(&h);       // spin until a slot is free
- *      if (!slot) { /* peer stall — see ZC_STALL_SPINS */ }
+ *      if (!slot) return 1;               // peer stall, see ZC_STALL_SPINS
  *      my_message_t *msg = (my_message_t *)slot;
  *      msg->seq   = 42;                   // write DIRECTLY into shm
  *      msg->value = 3.14;
@@ -521,7 +521,7 @@ static inline void zc_publish(zc_handle_t *h)
  *
  *  Usage:
  *      void *slot = zc_consume(&h);       // spin until data arrives
- *      if (!slot) { /* peer stall — see ZC_STALL_SPINS */ }
+ *      if (!slot) return 1;               // peer stall, see ZC_STALL_SPINS
  *      my_message_t *msg = (my_message_t *)slot;
  *      printf("seq=%lu\n", msg->seq);     // read DIRECTLY from shm
  *      zc_release(&h);                    // release-fence, slot recyclable
