@@ -20,7 +20,9 @@
 
 #include "zerocopy_futex.h"
 
+#ifndef MSG_COUNT
 #define MSG_COUNT        10000000ULL
+#endif
 #define CHECKSUM_MAGIC   0xDEADBEEFCAFEBABEULL
 #define GUARD_MAGIC      0xCAFED00DC0FFEEEEULL
 
@@ -35,10 +37,10 @@ int main(void)
 {
     zc_handle_t h;
 
-    zc_destroy(ZC_SHM_NAME);
-
-    if (zc_create(&h, ZC_SHM_NAME) != 0) {
-        perror("[futex-producer] zc_create");
+    /* Recover from any stale segment of a previous crashed run,
+     * then create a fresh ring (bumps the generation counter). */
+    if (zc_recover(&h, ZC_SHM_NAME) != 0) {
+        perror("[futex-producer] zc_recover");
         return 1;
     }
 
@@ -53,9 +55,16 @@ int main(void)
         (uint64_t)MSG_COUNT);
 
     uint64_t t_start = now_ns();
+    uint64_t t_last_progress = t_start;
 
     for (uint64_t seq = 0; seq < MSG_COUNT; ++seq) {
         uint8_t *slot = (uint8_t *)zc_futex_acquire(&h);
+        if (slot == NULL) {
+            fprintf(stderr, "[futex-producer] FATAL: peer stall — "
+                            "consumer presumed dead\n");
+            zc_close(&h);
+            return 1;
+        }
 
         uint64_t ts       = now_ns();
         uint64_t checksum = seq ^ CHECKSUM_MAGIC;
@@ -68,6 +77,19 @@ int main(void)
         memcpy(slot + ZC_SLOT_SIZE - 8, &guard, sizeof(guard));
 
         zc_futex_publish(&h);
+
+        /* Stall watchdog: if the consumer dies mid-run, bail out instead
+         * of waiting forever. Checked once per 1024 messages. */
+        if ((seq & 1023u) == 0) {
+            uint64_t now = now_ns();
+            if (now - t_last_progress > 5000000000ULL) {
+                fprintf(stderr, "[futex-producer] FATAL: no progress for 5 s — "
+                                "consumer presumed dead\n");
+                zc_close(&h);
+                return 1;
+            }
+            t_last_progress = now;
+        }
     }
 
     uint64_t t_end = now_ns();

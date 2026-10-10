@@ -1,0 +1,8 @@
+# build outputs (make clean removes these too)
+producer
+consumer
+futex_producer
+futex_consumer
+baseline_producer
+baseline_consumer
+t-*

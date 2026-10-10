@@ -18,7 +18,9 @@
 
 #include "zerocopy_futex.h"
 
+#ifndef MSG_COUNT
 #define MSG_COUNT        10000000ULL
+#endif
 #define CHECKSUM_MAGIC   0xDEADBEEFCAFEBABEULL
 #define GUARD_MAGIC      0xCAFED00DC0FFEEEEULL
 #define MAX_ERRORS_PRINT 10
@@ -82,6 +84,13 @@ int main(void)
 
     for (uint64_t i = 0; i < MSG_COUNT; ++i) {
         const uint8_t *slot = (const uint8_t *)zc_futex_consume(&h);
+        if (slot == NULL) {
+            fprintf(stderr, "[futex-consumer] FATAL: peer stall — "
+                            "producer presumed dead\n");
+            free(latencies);
+            zc_close(&h);
+            return 1;
+        }
         uint64_t t_recv     = now_ns();
 
         /* memcpy, not pointer casts (strict aliasing — see producer.c) */

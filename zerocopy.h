@@ -60,10 +60,31 @@
  *  Ring Buffer Constants
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Ring geometry is configurable at build time, e.g.
+ *   make SLOT_COUNT=256 SLOT_SIZE=1024
+ * Power-of-2 is enforced by static_assert below.                          */
+#ifndef ZC_SLOT_SIZE
 #define ZC_SLOT_SIZE    4096u                       /* bytes per slot (page)  */
+#endif
+#ifndef ZC_SLOT_COUNT
 #define ZC_SLOT_COUNT   1024u                       /* number of slots        */
-#define ZC_SLOT_MASK    (ZC_SLOT_COUNT - 1u)        /* 0x3FF — bitmask index  */
+#endif
+#define ZC_SLOT_MASK    (ZC_SLOT_COUNT - 1u)        /* bitmask index          */
+
+/* Stall timeout for the spin slow paths, in loop iterations.
+ * If the peer side makes no progress for this many iterations, the
+ * waiter presumes it dead and acquire/consume return NULL instead of
+ * spinning forever. ANY peer movement resets the counter, so a
+ * slow-but-alive peer never trips it. Override at build time;
+ * 0 = spin forever (legacy behavior). Default ≈ seconds on typical
+ * hardware. NOTE: start both peers together — a waiter also gives up
+ * if the peer never shows up in the first place. */
+#ifndef ZC_STALL_SPINS
+#define ZC_STALL_SPINS (1u << 28)
+#endif
 #define ZC_SHM_NAME     "/zerocopy_ring"            /* default shm object     */
+
+#define ZC_VERSION      "1.1.0"                     /* library version        */
 
 /* Compile-time proof: slot count is a power of two.
  * If not, the bitmask trick silently produces wrong indices.              */
@@ -269,6 +290,15 @@ static inline int zc_create(zc_handle_t *h, const char *name)
     close(fd);                                      /* fd no longer needed   */
     if (p == MAP_FAILED) return -1;
 
+#ifdef ZC_MLOCK
+    /* Lock pages in RAM: no page faults, deterministic latency.
+     * Build with MLOCK=1. Fails hard if the RLIMIT_MEMLOCK is too low. */
+    if (mlock(p, ZC_RING_SIZE) != 0) {
+        munmap(p, ZC_RING_SIZE);
+        return -1;
+    }
+#endif
+
     h->ring   = (zc_ring_t *)p;
     h->cached = 0;
 
@@ -392,11 +422,30 @@ static inline void zc_destroy(const char *name)
     shm_unlink(name);
 }
 
+/*
+ * zc_recover — Best-effort recovery from a crashed run (producer side).
+ *
+ * Removes any stale self-owned segment and creates a fresh ring, bumping
+ * the generation counter so stale consumers that re-open can tell the
+ * ring was re-created (see zc_create).
+ *
+ * If the stale segment is owned by ANOTHER user, the unlink fails and
+ * zc_create refuses with EACCES instead of touching it.
+ *
+ * Returns 0 on success, -1 on failure (check errno).
+ */
+static inline int zc_recover(zc_handle_t *h, const char *name)
+{
+    zc_destroy(name);
+    return zc_create(h, name);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Producer API — True Zero-Copy
  *
  *  Usage:
  *      void *slot = zc_acquire(&h);       // spin until a slot is free
+ *      if (!slot) { /* peer stall — see ZC_STALL_SPINS */ }
  *      my_message_t *msg = (my_message_t *)slot;
  *      msg->seq   = 42;                   // write DIRECTLY into shm
  *      msg->value = 3.14;
@@ -408,6 +457,9 @@ static inline void zc_destroy(const char *name)
 
 /*
  * zc_acquire — Spin until a slot is available; return a raw pointer into it.
+ *
+ * Returns NULL if the consumer makes no progress for ZC_STALL_SPINS
+ * iterations (peer presumed dead). Callers must check for NULL.
  *
  * Memory ordering rationale:
  *   We load our own head with relaxed (we are the only writer).
@@ -425,12 +477,21 @@ static inline void *zc_acquire(zc_handle_t *h)
     if (__builtin_expect((head - h->cached) < ZC_SLOT_COUNT, 1))
         goto slot;
 
-    /* ── Slow path: buffer LOOKS full — re-read the real tail ────────── */
+    /* ── Slow path: buffer LOOKS full — re-read the real tail.
+     * Stall detection: any consumer movement resets the counter, so
+     * only a truly dead (or never-started) peer trips the NULL return. */
+    uint64_t stall = 0, prev = h->cached;
     for (;;) {
         h->cached = atomic_load_explicit(&h->ring->ctl.tail,
                                           memory_order_acquire);
         if ((head - h->cached) < ZC_SLOT_COUNT)
             break;
+        if (h->cached != prev) {
+            prev = h->cached;
+            stall = 0;
+        } else if (ZC_STALL_SPINS != 0 && ++stall >= ZC_STALL_SPINS) {
+            return NULL;
+        }
         /* tight spin — baseline wait strategy */
         ZC_CPU_PAUSE();
     }
@@ -460,6 +521,7 @@ static inline void zc_publish(zc_handle_t *h)
  *
  *  Usage:
  *      void *slot = zc_consume(&h);       // spin until data arrives
+ *      if (!slot) { /* peer stall — see ZC_STALL_SPINS */ }
  *      my_message_t *msg = (my_message_t *)slot;
  *      printf("seq=%lu\n", msg->seq);     // read DIRECTLY from shm
  *      zc_release(&h);                    // release-fence, slot recyclable
@@ -470,6 +532,9 @@ static inline void zc_publish(zc_handle_t *h)
 
 /*
  * zc_consume — Spin until a message is available; return a raw pointer.
+ *
+ * Returns NULL if the producer makes no progress for ZC_STALL_SPINS
+ * iterations (peer presumed dead). Callers must check for NULL.
  *
  * Memory ordering rationale:
  *   We load our own tail with relaxed (we are the only writer).
@@ -486,12 +551,21 @@ static inline void *zc_consume(zc_handle_t *h)
     if (__builtin_expect(h->cached != tail, 1))
         goto slot;
 
-    /* ── Slow path: buffer LOOKS empty — re-read the real head ──────── */
+    /* ── Slow path: buffer LOOKS empty — re-read the real head.
+     * Stall detection: any producer movement resets the counter, so
+     * only a truly dead (or never-started) peer trips the NULL return. */
+    uint64_t stall = 0, prev = h->cached;
     for (;;) {
         h->cached = atomic_load_explicit(&h->ring->ctl.head,
                                           memory_order_acquire);
         if (h->cached != tail)
             break;
+        if (h->cached != prev) {
+            prev = h->cached;
+            stall = 0;
+        } else if (ZC_STALL_SPINS != 0 && ++stall >= ZC_STALL_SPINS) {
+            return NULL;
+        }
         /* tight spin — baseline wait strategy */
         ZC_CPU_PAUSE();
     }

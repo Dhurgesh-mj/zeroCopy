@@ -29,7 +29,9 @@
  *  Test Parameters  (must match producer.c)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+#ifndef MSG_COUNT
 #define MSG_COUNT        10000000ULL
+#endif
 #define CHECKSUM_MAGIC   0xDEADBEEFCAFEBABEULL
 #define GUARD_MAGIC      0xCAFED00DC0FFEEEEULL
 #define MAX_ERRORS_PRINT 10                     /* cap spew on systemic fail */
@@ -109,6 +111,13 @@ int main(void)
          * The consumer reads here — no memcpy, no intermediate buffer.
          */
         const uint8_t *slot = (const uint8_t *)zc_consume(&h);
+        if (slot == NULL) {
+            fprintf(stderr, "[consumer] FATAL: peer stall — "
+                            "producer presumed dead\n");
+            free(latencies);
+            zc_close(&h);
+            return 1;
+        }
         uint64_t t_recv     = now_ns();
 
         /* Read fields via memcpy (strict aliasing — see producer.c) */

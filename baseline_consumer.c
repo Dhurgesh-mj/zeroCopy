@@ -11,7 +11,9 @@
 #include <sys/un.h>
 #include <errno.h>
 
+#ifndef MSG_COUNT
 #define MSG_COUNT 10000000ULL
+#endif
 #define MSG_SIZE  4096u
 #define SOCK_NAME "zerocopy_baseline"   /* abstract-namespace socket name */
 #define CHECKSUM_MAGIC 0xDEADBEEFCAFEBABEULL

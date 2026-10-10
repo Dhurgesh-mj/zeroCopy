@@ -46,6 +46,14 @@
 #define ZC_FUTEX_WAIT_MS 100
 #endif
 
+/* Stall timeout for the futex slow paths, in bounded waits.
+ * If the peer makes no progress for this many waits, acquire/consume
+ * return NULL (peer presumed dead). ANY peer movement resets the
+ * counter. Default 50 waits × 100 ms ≈ 5 s. 0 = wait forever. */
+#ifndef ZC_FUTEX_MAX_WAITS
+#define ZC_FUTEX_MAX_WAITS 50
+#endif
+
 static inline long zc_futex_wait(uint32_t *addr, uint32_t expected)
 {
     struct timespec ts;
@@ -61,6 +69,9 @@ static inline long zc_futex_wake(uint32_t *addr)
 
 /*
  * zc_futex_acquire — Spin until a slot is available, with futex sleep fallback.
+ *
+ * Returns NULL if the consumer makes no progress for ZC_FUTEX_MAX_WAITS
+ * bounded waits (peer presumed dead). Callers must check for NULL.
  */
 static inline void *zc_futex_acquire(zc_handle_t *h)
 {
@@ -70,19 +81,26 @@ static inline void *zc_futex_acquire(zc_handle_t *h)
     if (__builtin_expect((head - h->cached) < ZC_SLOT_COUNT, 1))
         goto slot;
 
-    uint32_t spins = 0;
+    uint32_t spins = 0, waits = 0;
+    uint64_t prev = h->cached;
     for (;;) {
         h->cached = atomic_load_explicit(&h->ring->ctl.tail,
                                           memory_order_acquire);
         if ((head - h->cached) < ZC_SLOT_COUNT)
             break;
 
+        if (h->cached != prev) {
+            prev = h->cached;
+            waits = 0;
+        }
         if (++spins >= ZC_SPIN_LIMIT) {
             /* Wait on the consumer-owned word; expected = low 32 bits of
              * the last tail we observed. Stale expectation → EAGAIN →
              * loop re-reads the counter. */
             zc_futex_wait(&h->ring->ctl.tail_futex, (uint32_t)h->cached);
             spins = 0;
+            if (ZC_FUTEX_MAX_WAITS != 0 && ++waits >= ZC_FUTEX_MAX_WAITS)
+                return NULL;
         } else {
             ZC_CPU_PAUSE();
         }
@@ -109,6 +127,9 @@ static inline void zc_futex_publish(zc_handle_t *h)
 
 /*
  * zc_futex_consume — Spin until data arrives, with futex sleep fallback.
+ *
+ * Returns NULL if the producer makes no progress for ZC_FUTEX_MAX_WAITS
+ * bounded waits (peer presumed dead). Callers must check for NULL.
  */
 static inline void *zc_futex_consume(zc_handle_t *h)
 {
@@ -118,18 +139,25 @@ static inline void *zc_futex_consume(zc_handle_t *h)
     if (__builtin_expect(h->cached != tail, 1))
         goto slot;
 
-    uint32_t spins = 0;
+    uint32_t spins = 0, waits = 0;
+    uint64_t prev = h->cached;
     for (;;) {
         h->cached = atomic_load_explicit(&h->ring->ctl.head,
                                           memory_order_acquire);
         if (h->cached != tail)
             break;
 
+        if (h->cached != prev) {
+            prev = h->cached;
+            waits = 0;
+        }
         if (++spins >= ZC_SPIN_LIMIT) {
             /* Wait on the producer-owned word; expected = low 32 bits of
              * the last head we observed. */
             zc_futex_wait(&h->ring->ctl.head_futex, (uint32_t)h->cached);
             spins = 0;
+            if (ZC_FUTEX_MAX_WAITS != 0 && ++waits >= ZC_FUTEX_MAX_WAITS)
+                return NULL;
         } else {
             ZC_CPU_PAUSE();
         }

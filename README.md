@@ -85,6 +85,16 @@ memcpy() calls:        0                2             ← true zero-copy
 
 > **Note:** p50/p99 include startup delay (producer fills buffer before consumer starts). The **min of 26 ns** represents true steady-state latency.
 
+### Proof of Zero-Copy
+
+Claims are checked in, not asserted — `make verify-zero-copy` proves the data path:
+
+| Check | Method | Result |
+|---|---|---|
+| No copy calls | `objdump`: zero `memcpy` PLT calls in hot binaries (fixed-size copies inline to `mov`) | PASS |
+| No per-message syscalls | `strace` on a live run: zero `read`/`write`/`send`/`recv` (only `stderr` writes on fd 2) | PASS |
+| No kernel involvement | `perf`: context switches ~0 (vs ~20M for the socket baseline) | PASS |
+
 ---
 
 ## Quick Start
@@ -111,6 +121,15 @@ make test-uds
 
 # All three back-to-back
 make test-all
+
+# Correctness suite (wraparound, restart, kill, version, owner)
+make test-unit
+
+# Prove zero-copy (objdump + strace + perf checks)
+make verify-zero-copy
+
+# Fast live showcase (spin + futex, 100k messages)
+make demo
 ```
 
 ### Run Full Benchmark
@@ -143,6 +162,9 @@ taskset -c 0 ./producer             taskset -c 1 ./consumer
 ├── futex_consumer.c         Futex hybrid consumer
 ├── baseline_producer.c      AF_UNIX SOCK_STREAM producer
 ├── baseline_consumer.c      AF_UNIX consumer + validator
+├── test_version.c           Unit test: corrupt-metadata rejection
+├── test_unit.sh             Correctness suite (make test-unit)
+├── verify_zerocopy.sh       Zero-copy proof (make verify-zero-copy)
 ├── Makefile                 Build system + test targets
 └── bench.sh                 Automated benchmark script
 ```
@@ -243,6 +265,55 @@ What it does **not** do:
 - **No confidentiality** — payload travels in plaintext shared memory.
 - **No tamper evidence** — checksums/guards are forgeable by anyone with write access.
 - **No sealing** — for stronger setups, consider `memfd_create()` + `F_SEAL_SHRINK`/`F_SEAL_GROW` instead of POSIX shm.
+
+## API Reference
+
+Header-only library: `#include "zerocopy.h"` (spin) or `#include "zerocopy_futex.h"` (hybrid). Version: `ZC_VERSION` (`"1.1.0"`).
+
+| Function | Role | Returns |
+|---|---|---|
+| `zc_create(h, name)` | Producer: create + init ring (`O_EXCL`, `0600`, generation bump) | 0 / -1 (errno) |
+| `zc_recover(h, name)` | Producer: destroy stale segment + create fresh | 0 / -1 (errno) |
+| `zc_open(h, name)` | Consumer: attach + validate size, owner, magic/ABI/layout | 0 / -1 (errno) |
+| `zc_acquire(h)` | Producer: spin until a slot is free → pointer into shm | pointer, or NULL on peer stall |
+| `zc_publish(h)` | Producer: release-store head, slot becomes visible | — |
+| `zc_consume(h)` | Consumer: spin until data arrives → pointer into shm | pointer, or NULL on peer stall |
+| `zc_release(h)` | Consumer: release-store tail, slot recyclable | — |
+| `zc_close(h)` | Unmap the segment | — |
+| `zc_destroy(name)` | Unlink the shm object | — |
+| `zc_futex_*` | Same shape with futex sleep fallback after `ZC_SPIN_LIMIT` spins | same (NULL on stall) |
+
+Attach-failure contract: `EAGAIN` = transient, retry · `EACCES` = someone else's segment, abort · `EPROTO` = invalid segment, abort.
+
+Stall tuning: spin paths give up and return NULL after `ZC_STALL_SPINS` iterations without peer movement (default 2²⁸ ≈ seconds); futex paths after `ZC_FUTEX_MAX_WAITS` bounded waits (default 50 ≈ 5 s). Any peer movement resets the counter, so a slow-but-alive peer never trips it. Set either to `0` to spin/wait forever (legacy). Start both peers together — a waiter also gives up if the peer never shows up.
+
+### Build knobs
+
+```bash
+make SLOT_COUNT=256 SLOT_SIZE=1024 MSG_COUNT=100000   # geometry + workload
+make BENCH=1        # adds -march=native (benchmark builds only)
+make MLOCK=1        # mlock the ring: no page faults, deterministic latency
+make CROSS_COMPILE=aarch64-linux-gnu-                  # cross builds
+make test-unit verify-zero-copy demo                   # correctness, proof, showcase
+```
+
+## Crash Recovery
+
+1. The survivor's watchdog fires within ~5 s (both sides) and exits(1) — no hangs.
+2. Owner removes the stale object if needed: `rm /dev/shm/zerocopy_ring`.
+3. Producer restarts with `zc_recover()` — fresh ring, generation bumped.
+4. Consumer re-opens; `zc_open` validates the new metadata.
+
+Restarting the producer while a consumer is still attached (without re-open) is unsupported — shut the consumer down first.
+
+## Roadmap
+
+- [ ] AArch64 runtime validation (compile-verified via cross-toolchain today)
+- [ ] 32-bit ARM support via `libatomic` (64-bit counters)
+- [ ] MPMC variant (atomic reservation on the hot path)
+- [ ] fd-passing peer authentication (`SCM_RIGHTS`) for multi-user hosts
+- [ ] `memfd_create()` + seals as a shm alternative
+- [ ] Yocto/Buildroot packaging
 
 ## Requirements
 
