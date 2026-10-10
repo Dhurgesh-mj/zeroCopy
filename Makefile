@@ -156,19 +156,19 @@ demo:
 	@echo " DEMO — Zero-Copy (Spin), 100k messages"
 	@echo "══════════════════════════════════════════════════════"
 	rm -f /dev/shm/zerocopy_ring
-	./t-producer 2>/dev/null &
+	./t-consumer 2>&1 | tail -25 &
 	sleep 0.3
-	./t-consumer 2>&1 | tail -25
-	wait
+	./t-producer 2>/dev/null
+	@wait
 	@echo ""
 	@echo "══════════════════════════════════════════════════════"
 	@echo " DEMO — Zero-Copy (Futex Hybrid), 100k messages"
 	@echo "══════════════════════════════════════════════════════"
 	rm -f /dev/shm/zerocopy_ring
-	./t-futex_producer 2>/dev/null &
+	./t-futex_consumer 2>&1 | tail -25 &
 	sleep 0.3
-	./t-futex_consumer 2>&1 | tail -25
-	wait
+	./t-futex_producer 2>/dev/null
+	@wait
 	@echo ""
 	@echo "UDS baseline (full 10M run): 0.20 M msg/s, 1420 ns min — see README."
 
