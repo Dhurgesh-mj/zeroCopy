@@ -195,7 +195,7 @@ int main(void)
     uint64_t lat_p50  = latencies[(size_t)(MSG_COUNT * 50  / 100)];
     uint64_t lat_p90  = latencies[(size_t)(MSG_COUNT * 90  / 100)];
     uint64_t lat_p99  = latencies[(size_t)(MSG_COUNT * 99  / 100)];
-    uint64_t lat_p999 = latencies[(size_t)(MSG_COUNT * 999 / 1000)];
+    uint64_t lat_p999 = latencies[(size_t)((uint64_t)MSG_COUNT * 999u / 1000u)];
 
     double lat_sum = 0.0;
     for (uint64_t i = 0; i < MSG_COUNT; ++i)

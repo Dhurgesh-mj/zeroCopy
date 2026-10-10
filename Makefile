@@ -33,8 +33,9 @@ LDFLAGS  = -pie -Wl,-z,relro,-z,now -lrt
 SLOT_COUNT ?= 1024
 SLOT_SIZE  ?= 4096
 MSG_COUNT  ?= 10000000
+# ULL suffix: MSG_COUNT must stay 64-bit (MSG_COUNT * 999 overflows int).
 DEFS = -DZC_SLOT_COUNT=$(SLOT_COUNT) -DZC_SLOT_SIZE=$(SLOT_SIZE) \
-       -DMSG_COUNT=$(MSG_COUNT)
+       -DMSG_COUNT=$(MSG_COUNT)ULL
 
 ifeq ($(BENCH),1)
 CFLAGS += -march=native

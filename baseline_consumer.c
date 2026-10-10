@@ -159,7 +159,7 @@ int main() {
         latencies[(size_t)(MSG_COUNT * 50 / 100)],
         latencies[(size_t)(MSG_COUNT * 90 / 100)],
         latencies[(size_t)(MSG_COUNT * 99 / 100)],
-        latencies[(size_t)(MSG_COUNT * 999 / 1000)],
+        latencies[(size_t)((uint64_t)MSG_COUNT * 999u / 1000)],
         latencies[MSG_COUNT - 1]);
 
     if (errors == 0) {
