@@ -57,7 +57,7 @@ TESTBINS = t-producer t-consumer t-futex_producer t-futex_consumer \
 
 PREFIX ?= /usr/local
 
-.PHONY: all clean test test-futex test-uds test-all test-unit verify-zero-copy demo bench install
+.PHONY: all clean test test-futex test-uds test-all test-unit verify-zero-copy demo demo-compare bench install
 
 all: $(TARGETS)
 
@@ -147,6 +147,29 @@ bench:
 	$(MAKE) BENCH=1 all
 	chmod +x bench.sh
 	./bench.sh
+
+# ── Live Comparison: zero-copy vs normal socket, 100k messages ─────────────
+
+demo-compare:
+	$(MAKE) -s MSG_COUNT=100000 t-producer t-consumer t-baseline_producer t-baseline_consumer
+	@echo "══════════════════════════════════════════════════════"
+	@echo " ZERO-COPY (Spin) — 100k messages"
+	@echo "══════════════════════════════════════════════════════"
+	rm -f /dev/shm/zerocopy_ring
+	./t-consumer 2>&1 | grep -E "throughput|min:|errors:" &
+	sleep 0.3
+	./t-producer 2>/dev/null
+	@wait
+	@echo ""
+	@echo "══════════════════════════════════════════════════════"
+	@echo " NORMAL UNIX SOCKET — 100k messages"
+	@echo "══════════════════════════════════════════════════════"
+	./t-baseline_producer >/dev/null 2>&1 &
+	sleep 0.3
+	./t-baseline_consumer 2>&1 | grep -E "throughput|min:|errors:"
+	@wait
+	@echo ""
+	@echo "Same messages. Same machine. Compare the two throughput lines."
 
 # ── Live Demo (fast: 100k messages, spin + futex) ──────────────────────────
 
