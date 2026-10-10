@@ -9,6 +9,7 @@
  * Run:    ./t-version            (expects exit 0 + PASS)
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <errno.h>
 
